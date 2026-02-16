@@ -16,16 +16,12 @@ from .cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
-# -----------------------
-# Simple Metrics Counters
-# -----------------------
+
 success_counter = 0
 failure_counter = 0
 fallback_counter = 0
 
-# -----------------------
-# Initialize Celery
-# -----------------------
+
 celery_app = Celery(
     "matching_system",
     broker=os.getenv("REDIS_BROKER_URL", "redis://localhost:6379/0"),
@@ -43,9 +39,6 @@ celery_app.conf.update(
     task_soft_time_limit=8
 )
 
-# -----------------------
-# Async Helpers
-# -----------------------
 def run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -59,9 +52,6 @@ async def with_timeout(coro, seconds: int = 5):
     return await asyncio.wait_for(coro, timeout=seconds)
 
 
-# -----------------------
-# Main Task
-# -----------------------
 @celery_app.task(
     name="process_match_task",
     bind=True,max_retries=3
@@ -75,7 +65,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
     logger.info(f"[{task_id}] Task started for user {user_data['user_id']}")
 
     try:
-        # ---------------- PHASE 1 ----------------
+        
         self.update_state(state="PROCESSING", meta={"step": "sanitization"})
         logger.info(f"[{task_id}] Phase 1: Sanitization")
 
@@ -98,7 +88,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
             pii_removed=pii_removed,
         )
 
-        # ---------------- PHASE 2 ----------------
+        
         self.update_state(state="PROCESSING", meta={"step": "vectorization"})
         logger.info(f"[{task_id}] Phase 2: Vectorization")
 
@@ -118,7 +108,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
             user_data["user_id"], user_vector, ttl=604800
         )
 
-        # ---------------- PHASE 3 ----------------
+       
         self.update_state(state="PROCESSING", meta={"step": "hybrid_matching"})
         logger.info(f"[{task_id}] Phase 3: Hybrid Matching")
 
@@ -130,7 +120,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
             )
         )
 
-        # ---------------- PHASE 4 ----------------
+        
         self.update_state(state="PROCESSING", meta={"step": "decision_engine"})
         logger.info(f"[{task_id}] Phase 4: Decision Engine")
 
@@ -165,9 +155,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
         logger.error(f"[{task_id}] Error occurred: {error_message}")
         logger.error(f"[{task_id}] Retry count: {self.request.retries}")
 
-        # -----------------------------
-        # RETRY FOR TRANSIENT ERRORS
-        # -----------------------------
+     
         transient_errors = [
             "429",
             "timeout",
@@ -179,15 +167,13 @@ def process_match_task(self, user_data: Dict) -> Dict:
         if any(err in error_message for err in transient_errors):
             if self.request.retries < self.max_retries:
 
-                # Exponential backoff
+             
                 retry_delay = 2 ** self.request.retries
                 logger.warning(f"[{task_id}] Retrying in {retry_delay} seconds")
 
                 raise self.retry(exc=e, countdown=retry_delay)
 
-        # -----------------------------
-        # NON-RETRYABLE → FALLBACK
-        # -----------------------------
+       
         logger.warning(f"[{task_id}] Switching to fallback mode")
 
         popular = run_async(db_manager.get_popular_communities(limit=5))
@@ -205,9 +191,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
 
 
 
-# -----------------------
-# Hybrid Matching
-# -----------------------
+
 async def _hybrid_matching_algorithm(
     user_vector: List[float],
     city: str,
