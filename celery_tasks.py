@@ -7,7 +7,6 @@ from typing import Dict, List
 import os
 import time
 import asyncio
-from collections import Counter
 
 from .models import MatchTier, CommunityMatch, MatchResult, SanitizedProfile
 from .database import db_manager
@@ -15,7 +14,6 @@ from .ai_services import ai_service
 from .cache import cache_manager
 
 logger = logging.getLogger(__name__)
-
 
 success_counter = 0
 failure_counter = 0
@@ -39,25 +37,43 @@ celery_app.conf.update(
     task_soft_time_limit=8
 )
 
-def run_async(coro):
+from celery.signals import worker_process_init
+
+@worker_process_init.connect
+def init_worker(**kwargs):
+    logger.info("Initializing DB for Celery worker...")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
+    loop.run_until_complete(db_manager.initialize_postgres())
+    db_manager.initialize_pinecone()
 
-async def with_timeout(coro, seconds: int = 5):
-    return await asyncio.wait_for(coro, timeout=seconds)
+    loop.close()
 
+_task_loop = None
+
+def set_task_loop(loop):
+    global _task_loop
+    _task_loop = loop
+
+def run_async(coro):
+    global _task_loop
+    if _task_loop is None:
+        raise RuntimeError("Task loop not initialized")
+    return _task_loop.run_until_complete(coro)
 
 @celery_app.task(
     name="process_match_task",
-    bind=True,max_retries=3
+    bind=True,
+    max_retries=3
 )
 def process_match_task(self, user_data: Dict) -> Dict:
     global success_counter, failure_counter, fallback_counter
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    set_task_loop(loop)
 
     start_time = time.time()
     task_id = self.request.id
@@ -65,17 +81,14 @@ def process_match_task(self, user_data: Dict) -> Dict:
     logger.info(f"[{task_id}] Task started for user {user_data['user_id']}")
 
     try:
-        
+       
         self.update_state(state="PROCESSING", meta={"step": "sanitization"})
         logger.info(f"[{task_id}] Phase 1: Sanitization")
 
         sanitized_bio, enriched_tags, pii_removed = run_async(
-            with_timeout(
-                ai_service.sanitize_and_enrich_profile(
-                    user_data["bio"],
-                    user_data["interest_tags"],
-                ),
-                seconds=5,
+            ai_service.sanitize_and_enrich_profile(
+                user_data["bio"],
+                user_data["interest_tags"],
             )
         )
 
@@ -88,7 +101,7 @@ def process_match_task(self, user_data: Dict) -> Dict:
             pii_removed=pii_removed,
         )
 
-        
+       
         self.update_state(state="PROCESSING", meta={"step": "vectorization"})
         logger.info(f"[{task_id}] Phase 2: Vectorization")
 
@@ -98,17 +111,14 @@ def process_match_task(self, user_data: Dict) -> Dict:
         )
 
         user_vector = run_async(
-            with_timeout(
-                ai_service.generate_embedding(embedding_text),
-                seconds=5,
-            )
+            ai_service.generate_embedding(embedding_text)
         )
 
         cache_manager.set_user_vector(
             user_data["user_id"], user_vector, ttl=604800
         )
 
-       
+        
         self.update_state(state="PROCESSING", meta={"step": "hybrid_matching"})
         logger.info(f"[{task_id}] Phase 3: Hybrid Matching")
 
@@ -148,14 +158,12 @@ def process_match_task(self, user_data: Dict) -> Dict:
         return result.dict()
 
     except Exception as e:
-        global failure_counter
         failure_counter += 1
-
         error_message = str(e)
-        logger.error(f"[{task_id}] Error occurred: {error_message}")
+
+        logger.error(f"[{task_id}] Error: {error_message}")
         logger.error(f"[{task_id}] Retry count: {self.request.retries}")
 
-     
         transient_errors = [
             "429",
             "timeout",
@@ -166,17 +174,15 @@ def process_match_task(self, user_data: Dict) -> Dict:
 
         if any(err in error_message for err in transient_errors):
             if self.request.retries < self.max_retries:
-
-             
                 retry_delay = 2 ** self.request.retries
-                logger.warning(f"[{task_id}] Retrying in {retry_delay} seconds")
-
+                logger.warning(f"[{task_id}] Retrying in {retry_delay}s")
                 raise self.retry(exc=e, countdown=retry_delay)
 
-       
         logger.warning(f"[{task_id}] Switching to fallback mode")
 
         popular = run_async(db_manager.get_popular_communities(limit=5))
+
+        fallback_counter += 1
 
         fallback_result = MatchResult(
             task_id=task_id,
@@ -189,137 +195,6 @@ def process_match_task(self, user_data: Dict) -> Dict:
 
         return fallback_result.dict()
 
-
-
-
-async def _hybrid_matching_algorithm(
-    user_vector: List[float],
-    city: str,
-    timezone: str,
-) -> List[Dict]:
-
-    filtered_communities = await db_manager.filter_communities_by_location(
-        city=city,
-        timezone=timezone,
-        limit=1000,
-    )
-
-    if not filtered_communities:
-        return await db_manager.get_popular_communities(limit=5)
-
-    community_ids = [c["community_id"] for c in filtered_communities]
-
-    vector_matches = db_manager.vector_search(
-        query_vector=user_vector,
-        community_ids=community_ids,
-        top_k=20,
-    )
-
-    community_map = {
-        c["community_id"]: c for c in filtered_communities
-    }
-
-    enriched_matches = []
-
-    for vm in vector_matches:
-        comm_id = vm["community_id"]
-        if comm_id in community_map:
-            community = community_map[comm_id]
-            enriched_matches.append(
-                {
-                    "community_id": comm_id,
-                    "community_name": community["community_name"],
-                    "category": community["category"],
-                    "match_score": vm["match_score"],
-                    "member_count": community["member_count"],
-                    "recent_activity": community["recent_activity"],
-                }
-            )
-
-    return _apply_diversity_filter(enriched_matches)
-
-
-def _apply_diversity_filter(matches: List[Dict]) -> List[Dict]:
-    if len(matches) < 4:
-        return matches
-
-    top_3_categories = [m["category"] for m in matches[:3]]
-
-    if len(set(top_3_categories)) == 1:
-        dominant_category = top_3_categories[0]
-
-        for i in range(3, len(matches)):
-            if matches[i]["category"] != dominant_category:
-                diverse_match = matches.pop(i)
-                matches.insert(2, diverse_match)
-                break
-
-    return matches
-
-
-async def _apply_decision_engine(
-    task_id: str,
-    user_id: str,
-    user_bio: str,
-    matches: List[Dict],
-) -> MatchResult:
-
-    if not matches:
-        popular = await db_manager.get_popular_communities(limit=5)
-        return MatchResult(
-            task_id=task_id,
-            user_id=user_id,
-            tier=MatchTier.FALLBACK,
-            matches=[_to_community_match(c, 0.0) for c in popular],
-            requires_profile_update=True,
-            processing_time_ms=0,
-        )
-
-    top_match = matches[0]
-    top_score = top_match["match_score"]
-
-    if top_score > 0.87:
-        return MatchResult(
-            task_id=task_id,
-            user_id=user_id,
-            tier=MatchTier.SOULMATE,
-            matches=[_to_community_match(top_match)],
-            auto_joined_community=top_match["community_id"],
-            ai_intro_generated=False,
-            processing_time_ms=0,
-        )
-
-    elif top_score >= 0.55:
-        return MatchResult(
-            task_id=task_id,
-            user_id=user_id,
-            tier=MatchTier.EXPLORER,
-            matches=[_to_community_match(m) for m in matches[:5]],
-            processing_time_ms=0,
-        )
-
-    else:
-        popular = await db_manager.get_popular_communities(limit=5)
-        return MatchResult(
-            task_id=task_id,
-            user_id=user_id,
-            tier=MatchTier.FALLBACK,
-            matches=[_to_community_match(c, 0.0) for c in popular],
-            requires_profile_update=True,
-            processing_time_ms=0,
-        )
-
-
-def _to_community_match(
-    community: Dict, score: float = None
-) -> CommunityMatch:
-    return CommunityMatch(
-        community_id=community["community_id"],
-        community_name=community["community_name"],
-        category=community["category"],
-        match_score=score
-        if score is not None
-        else community.get("match_score", 0.0),
-        member_count=community["member_count"],
-        recent_activity=community.get("recent_activity", 0),
-    )
+    finally:
+        if not loop.is_closed():
+            loop.close()
